@@ -22,7 +22,11 @@
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+POST /api/sequences/recompute
+POST /api/sequences/&lt;batch_id&gt;/retry
+POST /api/sequences/backfill
+GET  /api/sequences/&lt;id&gt;/notices</pre>
 </main>
 <script>
 async function checkHealth() {

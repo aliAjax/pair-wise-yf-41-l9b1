@@ -71,7 +71,10 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            if isinstance(exc, ConflictError) and getattr(exc, "details", None):
+                payload["details"] = exc.details
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -85,6 +88,14 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 4 and parts[:2] == ["api", "sequences"] and parts[3] == "notices":
+                    return self._send(200, {"items": service.list_notices(parts[2])})
+                if len(parts) == 2 and parts == ["api", "sequences", "batch"]:
+                    query = parse_qs(parsed.query)
+                    batch_id = query.get("id", [None])[0]
+                    if not batch_id:
+                        raise ValidationError("batch id is required")
+                    return self._send(200, service.get_recompute_batch(batch_id))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -137,6 +148,27 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
+                    )
+                if parts == ["api", "sequences", "recompute"]:
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.recompute_batch(actor, body.get("sequence_ids")),
+                    )
+                if len(parts) == 4 and parts[:2] == ["api", "sequences"] and parts[3] == "retry":
+                    return self._send(
+                        200,
+                        service.retry_recompute_batch(actor, parts[2]),
+                    )
+                if parts == ["api", "sequences", "backfill"]:
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.backfill_sequences(
+                            actor,
+                            window_days=body.get("window_days"),
+                            window_distance_km=body.get("window_distance_km"),
+                        ),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
