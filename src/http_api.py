@@ -118,6 +118,19 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], action, data, expected),
                     )
+                if len(parts) == 4 and parts[:2] == ["api", "sequence"] and parts[3] == "actions":
+                    body = self._body()
+                    action = body.pop("action", None)
+                    if not action:
+                        raise ValidationError("action is required")
+                    data = body.pop("data", body)
+                    expected = body.pop("expected_version", None)
+                    return self._send(
+                        200,
+                        service.sequence_action(actor, parts[2], action, data, expected),
+                    )
+                if len(parts) == 3 and parts == ["api", "sequences", "backfill"]:
+                    return self._send(200, service.backfill_sequences(actor))
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()
                     action = body.pop("action", None)

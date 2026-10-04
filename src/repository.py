@@ -140,6 +140,64 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def apply_sequence_step(self, sequence_id, expected_version, sequence_data, event_id, event_patch):
+        """Apply one member change (add/remove) and record batch progress atomically.
+
+        Both the sequence (member_ids + batch progress) and the event (sequence_id
+        attribution) are updated in a single transaction, so a failure leaves
+        either both applied or neither — an unfinished batch can be resumed
+        without re-modifying members already recorded as processed.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version, data FROM entities WHERE id = ? AND kind = 'sequence'",
+                (sequence_id,),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("sequence not found: " + sequence_id)
+            current_version = int(row["version"])
+            if expected_version is not None and current_version != int(expected_version):
+                mainshock = None
+                try:
+                    mainshock = json.loads(row["data"]).get("mainshock_id")
+                except (ValueError, TypeError):
+                    pass
+                raise ConflictError(
+                    "version conflict: expected %s, found %s; current mainshock: %s"
+                    % (expected_version, current_version, mainshock)
+                )
+            connection.execute(
+                "UPDATE entities SET version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (
+                    json.dumps(sequence_data, ensure_ascii=False, sort_keys=True),
+                    now,
+                    sequence_id,
+                    current_version,
+                ),
+            )
+            erow = connection.execute(
+                "SELECT data FROM entities WHERE id = ? AND kind = 'event'",
+                (event_id,),
+            ).fetchone()
+            if erow:
+                edata = json.loads(erow["data"])
+                edata.update(event_patch)
+                connection.execute(
+                    "UPDATE entities SET version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(edata, ensure_ascii=False, sort_keys=True), now, event_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(sequence_id)
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

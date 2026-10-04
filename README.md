@@ -24,7 +24,23 @@ python3 app.py --db ./data.db --port 8307
 
 ## 核心对象
 
-- `station`：观测台站；`event`：地震事件及其多个修订版本。
+- `station`：观测台站；`event`：地震事件及其多个修订版本；`sequence`：余震序列，按主震时空窗口归并相邻地震。
+
+## 余震序列
+
+- 主震按**震级最大、时间最早**确定；主震一变，序列成员立刻重算——跳出时空窗口的移出，新落进来的收进来。
+- 时空窗口由 `window.max_days`（天）和 `window.max_distance_km`（震中距，Haversine）定义；事件需带 `lat`/`lon`。
+- 重算按批次处理：整批失败后留下未完成批次（`batch.status = in_progress`），重试时跳过已处理成员，不重复改动。
+- 发过序列公告的按原版本冻结；重算结果作为新公告版本留存，旧版本不变。
+- 两名编目员提交同一序列时，后到的会收到 `409` 冲突，消息中含当前主震。
+- 旧数据无序列归属，升级时按主震窗口回填（`POST /api/sequences/backfill`）。
+
+### 序列接口
+
+- `POST /api/sequence`：创建序列（`name`、`mainshock_id`、`member_ids`、`window`）。
+- `POST /api/sequence/<id>/actions`：`action` 取 `recalculate` / `publish_announcement` / `backfill`。
+- `POST /api/sequences/backfill`：全局回填无归属的地震事件。
+- 事件创建或震级修订后自动重算其所属序列，无需手动触发。
 
 ## 主要接口
 

@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, timedelta
 
 from .domain import (
@@ -49,17 +50,128 @@ def magnitude_median(amplitudes):
     return (values[middle - 1] + values[middle]) / 2.0
 
 
-CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
+def _validate_sequence(actor, data, lookup):
+    if not data.get("name"):
+        raise ValidationError("sequence name is required")
+    window = data.get("window") or {}
+    if window.get("max_days") is None and window.get("max_distance_km") is None:
+        raise ValidationError("sequence window requires max_days or max_distance_km")
+
+
+def _parse_origin(value):
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    radius = 6371.0
+    dlat = math.radians(float(lat2) - float(lat1))
+    dlon = math.radians(float(lon2) - float(lon1))
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(float(lat1)))
+        * math.cos(math.radians(float(lat2)))
+        * math.sin(dlon / 2) ** 2
+    )
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def select_mainshock(events):
+    """Mainshock = largest magnitude, ties broken by earliest origin time."""
+    candidates = [event for event in events if event.get("data", {}).get("magnitude") is not None]
+    if not candidates:
+        return None
+
+    def _key(event):
+        data = event["data"]
+        return (-float(data["magnitude"]), str(data.get("origin_time", "")))
+
+    return min(candidates, key=_key)
+
+
+def in_aftershock_window(event, mainshock, window):
+    """True when event is within the sequence's space-time window of the mainshock."""
+    if not window:
+        return True
+    max_days = window.get("max_days")
+    max_distance = window.get("max_distance_km")
+    if max_days is not None:
+        origin = event.get("data", {}).get("origin_time")
+        main_origin = mainshock.get("data", {}).get("origin_time")
+        if origin and main_origin:
+            delta_days = abs((_parse_origin(origin) - _parse_origin(main_origin)).total_seconds()) / 86400.0
+            if delta_days > float(max_days):
+                return False
+    if max_distance is not None:
+        lat1 = event.get("data", {}).get("lat")
+        lon1 = event.get("data", {}).get("lon")
+        lat2 = mainshock.get("data", {}).get("lat")
+        lon2 = mainshock.get("data", {}).get("lon")
+        if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+            return False
+        if haversine_km(lat1, lon1, lat2, lon2) > float(max_distance):
+            return False
+    return True
+
+
+def recalculate_plan(sequence, all_events):
+    """Recompute the mainshock and member set for a sequence.
+
+    The mainshock is the largest event in the cluster; the cluster is the set
+    of events within the space-time window of the mainshock. Iterates until the
+    mainshock is stable so a bigger event re-centers the window.
+    Returns (mainshock_id, to_add, to_remove, final_member_ids).
+    """
+    data = sequence.get("data", {})
+    window = data.get("window") or {}
+    events_by_id = {event["id"]: event for event in all_events}
+    current_members = set(data.get("member_ids") or [])
+
+    anchor_id = data.get("mainshock_id")
+    if anchor_id not in events_by_id:
+        seed = [events_by_id[member] for member in current_members if member in events_by_id]
+        if not seed:
+            seed = list(events_by_id.values())
+        anchor = select_mainshock(seed)
+        anchor_id = anchor["id"] if anchor else None
+
+    mainshock_id = anchor_id
+    cluster = set()
+    seen = set()
+    for _ in range(20):
+        if mainshock_id in seen:
+            break
+        seen.add(mainshock_id)
+        anchor = events_by_id.get(mainshock_id)
+        if anchor is None:
+            break
+        cluster = {
+            event_id
+            for event_id, event in events_by_id.items()
+            if in_aftershock_window(event, anchor, window)
+        }
+        new_mainshock = select_mainshock([events_by_id[event_id] for event_id in cluster])
+        new_id = new_mainshock["id"] if new_mainshock else None
+        if new_id == mainshock_id:
+            break
+        mainshock_id = new_id
+
+    final_members = cluster
+    to_add = sorted(final_members - current_members)
+    to_remove = sorted(current_members - final_members)
+    return mainshock_id, to_add, to_remove, sorted(final_members)
+
+
+CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event, 'sequence': _validate_sequence}
 CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
 
 
 class RuleEngine:
-    ALIASES = {'stations': 'station', 'events': 'event'}
-    INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
+    ALIASES = {'stations': 'station', 'events': 'event', 'sequences': 'sequence'}
+    INITIAL_STATUS = {'station': 'online', 'event': 'candidate', 'sequence': 'active'}
     TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
-    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
+    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports'), 'sequence': ('name', 'window')}
     ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
-    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
+    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst'), 'sequence': ('admin', 'analyst')}
     ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
 
     def normalize_kind(self, kind):
@@ -115,6 +227,15 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def select_mainshock(self, events):
+        return select_mainshock(events)
+
+    def in_aftershock_window(self, event, mainshock, window):
+        return in_aftershock_window(event, mainshock, window)
+
+    def recalculate_plan(self, sequence, all_events):
+        return recalculate_plan(sequence, all_events)
 
 
 def _find_one(lookup, kind, field, value):
